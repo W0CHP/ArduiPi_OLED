@@ -34,6 +34,14 @@ All text above, and the splash screen below must be included in any redistributi
 *********************************************************************/
 
 #include "./ArduiPi_OLED_lib.h" 
+// WPSD: I2C through the kernel's i2c-dev driver (/dev/i2c-1) instead of
+// the bcm2835 library's direct register access, which needs /dev/mem
+// (root) and does not exist on a Pi 5. SPI still uses bcm2835.
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/i2c-dev.h>
+static int wpsd_i2c_fd = -1;
+static const char* wpsd_i2c_dev = "/dev/i2c-1";
 #include "./Adafruit_GFX.h"
 #include "./ArduiPi_OLED.h"
 
@@ -160,7 +168,9 @@ inline void ArduiPi_OLED::fastSPIwrite(char* tbuf, uint32_t len) {
   bcm2835_spi_writenb(tbuf, len);
 }
 inline void ArduiPi_OLED::fastI2Cwrite(char* tbuf, uint32_t len) {
-  bcm2835_i2c_write(tbuf, len);
+  if (wpsd_i2c_fd >= 0 && ::write(wpsd_i2c_fd, tbuf, len) != (ssize_t)len) {
+    // A display that stops answering must not stop the driver.
+  }
 }
 
 // the most basic function, set a single pixel
@@ -337,8 +347,8 @@ boolean ArduiPi_OLED::select_oled(uint8_t OLED_TYPE)
   if (!poledbuff)
     return false;
 
-  // Init Raspberry PI GPIO
-  if (!bcm2835_init())
+  // Init Raspberry PI GPIO (SPI only; I2C goes through i2c-dev)
+  if (isSPI() && !bcm2835_init())
     return false;
     
   return true;
@@ -384,19 +394,21 @@ boolean ArduiPi_OLED::init(int8_t RST, uint8_t OLED_TYPE)
   if (!select_oled(OLED_TYPE))
     return false;
 
-  // Init & Configure Raspberry PI I2C
-  if (bcm2835_i2c_begin()==0)
+  // Open the I2C bus and address the display. I2C OLED modules have
+  // no reset line, so no GPIO is touched.
+  if (wpsd_i2c_fd >= 0)
+    ::close(wpsd_i2c_fd);
+  wpsd_i2c_fd = ::open(wpsd_i2c_dev, O_RDWR);
+  if (wpsd_i2c_fd < 0) {
+    fprintf(stderr, "ArduiPi_OLED: cannot open %s (is the i2c-dev module loaded?)\n", wpsd_i2c_dev);
     return false;
-    
-  bcm2835_i2c_setSlaveAddress(_i2c_addr) ;
-    
-  // Set clock to 400 KHz
-  // does not seem to work, will check this later
-  // bcm2835_i2c_set_baudrate(400000);
-
-  // Setup reset pin direction as output
-  bcm2835_gpio_fsel(rst, BCM2835_GPIO_FSEL_OUTP);
-  
+  }
+  if (::ioctl(wpsd_i2c_fd, I2C_SLAVE, _i2c_addr) < 0) {
+    fprintf(stderr, "ArduiPi_OLED: cannot address the display at 0x%02X on %s\n", _i2c_addr, wpsd_i2c_dev);
+    ::close(wpsd_i2c_fd);
+    wpsd_i2c_fd = -1;
+    return false;
+  }
   return ( true);
 }
 
@@ -413,11 +425,14 @@ void ArduiPi_OLED::close(void)
     bcm2835_spi_end();
 
     // Release Raspberry I2C
-  if ( isI2C() )
-    bcm2835_i2c_end();
+  if ( isI2C() && wpsd_i2c_fd >= 0 ) {
+    ::close(wpsd_i2c_fd);
+    wpsd_i2c_fd = -1;
+  }
 
   // Release Raspberry I/O control
-  bcm2835_close();
+  if ( isSPI() )
+    bcm2835_close();
 }
 
   
@@ -431,21 +446,27 @@ void ArduiPi_OLED::begin( void )
   
   constructor(oled_width, oled_height);
 
-  // Setup reset pin direction (used by both SPI and I2C)  
-  bcm2835_gpio_fsel(rst, BCM2835_GPIO_FSEL_OUTP);
-  bcm2835_gpio_write(rst, HIGH);
-  
-  // VDD (3.3V) goes high at start, lets just chill for a ms
-  usleep(1000);
-  
-  // bring reset low
-  bcm2835_gpio_write(rst, LOW);
-  
-  // wait 10ms
-  usleep(10000);
-  
-  // bring out of reset
-  bcm2835_gpio_write(rst, HIGH);
+  // Pulse the reset pin (SPI displays; I2C modules have none, and the
+  // GPIO is left alone)
+  if (isSPI())
+  {
+    bcm2835_gpio_fsel(rst, BCM2835_GPIO_FSEL_OUTP);
+    bcm2835_gpio_write(rst, HIGH);
+
+    // VDD (3.3V) goes high at start, lets just chill for a ms
+    usleep(1000);
+
+    // bring reset low
+    bcm2835_gpio_write(rst, LOW);
+
+    // wait 10ms
+    usleep(10000);
+
+    // bring out of reset
+    bcm2835_gpio_write(rst, HIGH);
+  }
+  else
+    usleep(1000);
   
   // depends on OLED type configuration
   if (oled_height == 32)
