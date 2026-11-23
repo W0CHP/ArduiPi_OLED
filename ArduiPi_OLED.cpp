@@ -33,6 +33,13 @@ All text above, and the splash screen below must be included in any redistributi
             
 *********************************************************************/
 
+// WPSD: the standard headers the SH1106 scroll needs, before the
+// library's min/max macros.
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
+#include <string.h>
 #include "./ArduiPi_OLED_lib.h" 
 // WPSD: I2C through the kernel's i2c-dev driver (/dev/i2c-1) instead of
 // the bcm2835 library's direct register access, which needs /dev/mem
@@ -42,6 +49,158 @@ All text above, and the splash screen below must be included in any redistributi
 #include <linux/i2c-dev.h>
 static int wpsd_i2c_fd = -1;
 static const char* wpsd_i2c_dev = "/dev/i2c-1";
+
+// WPSD: scrolling on the SH1106 (1.3"). The scroll calls send the
+// SSD1306's hardware scroll commands, which the SH1106 doesn't have: it
+// takes those bytes as column, start line and other commands, and the
+// text tears. On an SH1106 the scroll is done here instead: the last frame
+// shown is kept, and a thread redraws the scrolling pages shifted a step
+// at a time (the vertical part of a diagonal scroll is the SH1106's own
+// start line register). Every I2C write holds wpsd_mu, so the thread's
+// page writes never interleave with the driver's. SSD1306 unchanged.
+
+static std::recursive_mutex wpsd_mu;
+
+namespace {
+struct SoftScroll {
+  std::condition_variable_any cv;
+  std::thread th;
+  bool running = false; // the thread
+  bool on = false;      // a scroll is active
+  bool quit = false;
+  bool diag = false;
+  int dir = 1;          // 1 left, -1 right
+  int p0 = 0, p1 = 0;   // the pages that scroll
+  int off = 0;          // columns shifted
+  int line = 0;         // diagonal: start line
+  bool have = false;    // shown holds a frame
+  uint8_t shown[128 * 8];
+
+  ~SoftScroll() { stop(); }
+  void stop() {
+    {
+      std::lock_guard<std::recursive_mutex> g(wpsd_mu);
+      quit = true;
+    }
+    cv.notify_all();
+    if (th.joinable())
+      th.join();
+    running = false;
+    quit = false;
+  }
+};
+SoftScroll wpsd_scroll;
+
+void sh1106Write(const char* b, size_t n) {
+  if (wpsd_i2c_fd >= 0 && ::write(wpsd_i2c_fd, b, n) != (ssize_t)n) {
+    // A display that stops answering must not stop the driver.
+  }
+}
+
+void sh1106Cmd(uint8_t c) {
+  char b[2] = {0x00, (char)c};
+  sh1106Write(b, 2);
+}
+
+// One page of the frame kept, shifted when it scrolls; 128 columns from
+// column 2 of the SH1106's 132, as display() writes them.
+void sh1106Page(int k) {
+  SoftScroll& s = wpsd_scroll;
+  bool shifted = s.on && k >= s.p0 && k <= s.p1;
+  sh1106Cmd(0xB0 + k);
+  sh1106Cmd(0x02);
+  sh1106Cmd(0x10);
+  char buf[17];
+  buf[0] = 0x40;
+  for (int x = 0; x < 128; x += 16) {
+    for (int i = 0; i < 16; i++) {
+      int c = x + i;
+      if (shifted)
+        c = ((c + s.off) % 128 + 128) % 128;
+      buf[1 + i] = s.shown[k * 128 + c];
+    }
+    sh1106Write(buf, 17);
+  }
+}
+
+// About 25 columns a second, as the SSD1306's own scroll at the speed the
+// driver asks for; more pages a step take longer to send (each ~14 ms on a
+// 100 kHz bus), so they move further a step.
+int stepMs() {
+  int n = wpsd_scroll.p1 - wpsd_scroll.p0 + 1;
+  return n * 27 > 50 ? n * 27 : 50;
+}
+
+void scrollLoop() {
+  SoftScroll& s = wpsd_scroll;
+  std::unique_lock<std::recursive_mutex> g(wpsd_mu);
+  while (!s.quit) {
+    if (!s.on || !s.have) {
+      s.cv.wait(g);
+      continue;
+    }
+    int ms = stepMs();
+    if (s.cv.wait_for(g, std::chrono::milliseconds(ms)) == std::cv_status::no_timeout)
+      continue; // started, stopped or quit: look again
+    if (!s.on || s.quit)
+      continue;
+    int step = (ms * 25 + 500) / 1000;
+    s.off = (s.off + s.dir * (step > 0 ? step : 1)) % 128;
+    if (s.diag) {
+      s.line = (s.line + 1) % 64;
+      sh1106Cmd(0x40 | s.line);
+    }
+    for (int k = s.p0; k <= s.p1; k++)
+      sh1106Page(k);
+  }
+}
+
+void scrollStart(int start, int stop, bool diag, int dir) {
+  SoftScroll& s = wpsd_scroll;
+  std::lock_guard<std::recursive_mutex> g(wpsd_mu);
+  start &= 7;
+  stop &= 7;
+  if (stop < start) {
+    int t = start;
+    start = stop;
+    stop = t;
+  }
+  bool same = s.on && s.p0 == start && s.p1 == stop && s.diag == diag && s.dir == dir;
+  if (!same) {
+    s.p0 = start;
+    s.p1 = stop;
+    s.diag = diag;
+    s.dir = dir;
+    s.off = 0;
+    s.line = 0;
+  }
+  s.on = true;
+  if (!s.running) {
+    s.th = std::thread(scrollLoop);
+    s.running = true;
+  }
+  s.cv.notify_all();
+}
+
+// The scroll ends: the pages it moved are drawn back in place.
+void scrollStop() {
+  SoftScroll& s = wpsd_scroll;
+  std::lock_guard<std::recursive_mutex> g(wpsd_mu);
+  if (!s.on)
+    return;
+  s.on = false;
+  bool moved = s.off != 0 || s.line != 0;
+  s.off = 0;
+  if (s.line != 0) {
+    s.line = 0;
+    sh1106Cmd(0x40);
+  }
+  if (moved && s.have)
+    for (int k = s.p0; k <= s.p1; k++)
+      sh1106Page(k);
+  s.cv.notify_all();
+}
+} // namespace
 #include "./Adafruit_GFX.h"
 #include "./ArduiPi_OLED.h"
 
@@ -168,6 +327,7 @@ inline void ArduiPi_OLED::fastSPIwrite(char* tbuf, uint32_t len) {
   bcm2835_spi_writenb(tbuf, len);
 }
 inline void ArduiPi_OLED::fastI2Cwrite(char* tbuf, uint32_t len) {
+  std::lock_guard<std::recursive_mutex> g(wpsd_mu);
   if (wpsd_i2c_fd >= 0 && ::write(wpsd_i2c_fd, tbuf, len) != (ssize_t)len) {
     // A display that stops answering must not stop the driver.
   }
@@ -414,6 +574,10 @@ boolean ArduiPi_OLED::init(int8_t RST, uint8_t OLED_TYPE)
 
 void ArduiPi_OLED::close(void) 
 {
+  wpsd_scroll.stop();
+  wpsd_scroll.on = false;
+  wpsd_scroll.have = false;
+
   // De-Allocate memory for OLED buffer if any
   if (poledbuff)
     free(poledbuff);
@@ -774,6 +938,10 @@ void ArduiPi_OLED::sendCommand(uint8_t c0, uint8_t c1, uint8_t c2)
 // display.scrollright(0x00, 0x0F) 
 void ArduiPi_OLED::startscrollright(uint8_t start, uint8_t stop)
 {
+  if (oled_type == OLED_SH1106_I2C_128x64) {
+    scrollStart(start, stop, false, -1);
+    return;
+  }
   sendCommand(SSD_Right_Horizontal_Scroll);
   sendCommand(0X00);
   sendCommand(start);
@@ -790,6 +958,10 @@ void ArduiPi_OLED::startscrollright(uint8_t start, uint8_t stop)
 // display.scrollright(0x00, 0x0F) 
 void ArduiPi_OLED::startscrollleft(uint8_t start, uint8_t stop)
 {
+  if (oled_type == OLED_SH1106_I2C_128x64) {
+    scrollStart(start, stop, false, 1);
+    return;
+  }
   sendCommand(SSD_Left_Horizontal_Scroll);
   sendCommand(0X00);
   sendCommand(start);
@@ -806,6 +978,10 @@ void ArduiPi_OLED::startscrollleft(uint8_t start, uint8_t stop)
 // display.scrollright(0x00, 0x0F) 
 void ArduiPi_OLED::startscrolldiagright(uint8_t start, uint8_t stop)
 {
+  if (oled_type == OLED_SH1106_I2C_128x64) {
+    scrollStart(start, stop, true, -1);
+    return;
+  }
   sendCommand(SSD1306_SET_VERTICAL_SCROLL_AREA);  
   sendCommand(0X00);
   sendCommand(oled_height);
@@ -824,6 +1000,10 @@ void ArduiPi_OLED::startscrolldiagright(uint8_t start, uint8_t stop)
 // display.scrollright(0x00, 0x0F) 
 void ArduiPi_OLED::startscrolldiagleft(uint8_t start, uint8_t stop)
 {
+  if (oled_type == OLED_SH1106_I2C_128x64) {
+    scrollStart(start, stop, true, 1);
+    return;
+  }
   sendCommand(SSD1306_SET_VERTICAL_SCROLL_AREA);  
   sendCommand(0X00);
   sendCommand(oled_height);
@@ -861,6 +1041,10 @@ void ArduiPi_OLED::setHorizontalScrollProperties(bool direction,uint8_t startRow
 
 void ArduiPi_OLED::stopscroll(void)
 {
+  if (oled_type == OLED_SH1106_I2C_128x64) {
+    scrollStop();
+    return;
+  }
   sendCommand(SSD_Deactivate_Scroll);
 }
 
@@ -892,6 +1076,18 @@ void ArduiPi_OLED::sendData(uint8_t c)
 
 void ArduiPi_OLED::display(void) 
 {
+  if (oled_type == OLED_SH1106_I2C_128x64 && isI2C())
+  {
+    std::lock_guard<std::recursive_mutex> g(wpsd_mu);
+    memcpy(wpsd_scroll.shown, poledbuff, sizeof(wpsd_scroll.shown));
+    wpsd_scroll.have = true;
+    sh1106Cmd(0x40 | (wpsd_scroll.on && wpsd_scroll.diag ? wpsd_scroll.line : 0));
+    for (int k = 0; k < 8; k++)
+      sh1106Page(k);
+    wpsd_scroll.cv.notify_all();
+    return;
+  }
+
 
   if (oled_type == OLED_SEEED_I2C_96x96 )
   {
